@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+# starVLA eval image: built FROM the training image (Dockerfile.train), adds the
+# LIBERO evaluation environment.
+#
+# Build (from the repository root, after Dockerfile.train):
+#   docker build -f deployment/docker/Dockerfile.project -t starvla-eval:latest .
+#
+# The training env is the base image's system Python (Python 3.10, torch 2.6
+# cu124, numpy 1.26.4, deepspeed 0.16.9, flash-attn). LIBERO eval needs a
+# *separate* conda env `libero` because mujoco==3.2.3 + numpy==1.24.4 conflict
+# with the training pins. The LIBERO *source* itself is cloned at eval time onto
+# shared EFS (see geofastwam's run_libero_eval_in_pod.sh), not baked here.
+
+FROM starvla-train:latest
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG CONDA_VERSION=py310_24.9.2-0
+
+ENV PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=8
+ENV CONDA_DIR=/opt/conda
+# Do NOT prepend /opt/conda/bin to PATH at image level: the training image's
+# system Python (torch + starVLA + flash-attn) must stay the default `python` for
+# the policy server. The LIBERO env is invoked explicitly via
+# `conda run -n libero python` / `/opt/conda/envs/libero/bin/python`.
+
+# Miniconda (Python 3.10 base) — required for the separate `libero` env. curl is
+# already present in the base image.
+RUN curl -fsSL -o /tmp/miniconda.sh \
+        "https://repo.anaconda.com/miniconda/Miniconda3-${CONDA_VERSION}-Linux-x86_64.sh" \
+    && bash /tmp/miniconda.sh -b -p "${CONDA_DIR}" \
+    && rm -f /tmp/miniconda.sh \
+    && "${CONDA_DIR}/bin/conda" init bash \
+    && "${CONDA_DIR}/bin/conda" config --set always_yes yes
+
+# ---- LIBERO evaluation conda env (baked; LIBERO source cloned at eval time) ----
+# Mirrors examples/simBenchmarks/LIBERO/eval_files/install_libero.sh, minus the
+# LIBERO clone (which lives on EFS).
+RUN conda create -n libero python=3.10 -y \
+    && conda run -n libero python -m pip install --no-cache-dir --upgrade pip \
+    && conda run -n libero python -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
+        mujoco==3.2.3 \
+        numpy==1.24.4 \
+        tyro \
+        matplotlib \
+        mediapy \
+        websockets \
+        msgpack \
+        imageio \
+        tqdm \
+        pillow \
+        typing_extensions
+
+CMD ["/bin/bash"]
