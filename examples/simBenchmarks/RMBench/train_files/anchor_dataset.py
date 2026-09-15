@@ -34,7 +34,16 @@ class RMBenchAnchorDataset(LeRobotSingleDataset):
         return sample
 
 
-def get_vla_dataset(data_cfg, wm_cfg, anchor_cfg, **kwargs):
+def get_vla_dataset(
+    data_cfg,
+    wm_cfg=None,
+    anchor_cfg=None,
+    mode="train",
+    balance_dataset_weights=False,
+    balance_trajectory_weights=False,
+    seed=42,
+    **kwargs,
+):
     contract = memory_contract({"working_memory": wm_cfg, "rmbench_anchor": anchor_cfg})
     if contract is None or not str(data_cfg.data_mix).startswith("rmbench_"):
         raise ValueError("rmbench_anchor dataset requires enabled anchor and an rmbench_* data mix")
@@ -59,4 +68,12 @@ def get_vla_dataset(data_cfg, wm_cfg, anchor_cfg, **kwargs):
         )
         dataset.wm_cfg = wm_cfg
         datasets.append((dataset, weight))
-    return LeRobotMixtureDataset(datasets, data_cfg=data_cfg, **kwargs)
+    return LeRobotMixtureDataset(
+        datasets,
+        mode=mode,
+        balance_dataset_weights=balance_dataset_weights,
+        balance_trajectory_weights=balance_trajectory_weights,
+        seed=seed,
+        data_cfg=data_cfg,
+        **kwargs,
+    )
