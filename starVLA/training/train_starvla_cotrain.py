@@ -427,6 +427,12 @@ class VLAMTrainer(TrainerUtils):
 
     def _finalize_training(self):
         """Training end processing."""
+        # Keep the final step as a regular steps_N checkpoint too: max_train_steps
+        # is derived from num_train_epochs (ceil division) and is almost never a
+        # multiple of save_interval, so the end-of-training state would otherwise
+        # exist only as final_model/ without a step number.
+        if self.completed_steps % self.config.trainer.save_interval != 0:
+            self._save_checkpoint()
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")

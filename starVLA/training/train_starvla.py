@@ -14,6 +14,7 @@ Conventions:
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Tuple
@@ -45,6 +46,7 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
+from starVLA.training.trainer_utils.epoch_budget import _dataset_num_samples, resolve_max_train_steps
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
 deepspeed_plugin = DeepSpeedPlugin()
@@ -125,6 +127,7 @@ class VLATrainer(TrainerUtils):
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        self.dataset_num_samples = _dataset_num_samples(vla_train_dataloader)
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -223,7 +226,18 @@ class VLATrainer(TrainerUtils):
         self.resume_from_checkpoint = pretrained_checkpoint
 
         if is_resume:
-            resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
+            if pretrained_checkpoint:
+                # An explicit source may live outside this run (e.g. EFS).
+                match = re.fullmatch(
+                    r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)",
+                    os.path.basename(pretrained_checkpoint),
+                )
+                if not match or not os.path.isfile(pretrained_checkpoint):
+                    raise ValueError(f"Invalid resume checkpoint: {pretrained_checkpoint}")
+                resume_from_checkpoint = pretrained_checkpoint
+                self.completed_steps = int(match.group(1))
+            else:
+                resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
                 self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
@@ -292,12 +306,22 @@ class VLATrainer(TrainerUtils):
     def _log_metrics(self, metrics):
         """Record training metrics."""
         rank = dist.get_rank() if dist.is_initialized() else 0
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and rank == 0:
+        # Always log step 1: between the config banner and the first
+        # logging_frequency step the loop is otherwise silent (the tqdm
+        # carriage-return bar is invisible in aggregated pod logs), so a slow
+        # first step is indistinguishable from a hang.
+        if (self.completed_steps % self.config.trainer.logging_frequency == 0 or self.completed_steps == 1) and rank == 0:
             last_lrs = self.lr_scheduler.get_last_lr()
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
-            metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+            # Samples consumed / unique samples available. `len(dataloader)` is NOT
+            # usable here: it is already sharded per process AND excludes gradient
+            # accumulation, and for a mixture it counts max(len_i/weight_i) rather
+            # than the real data volume. See `_dataset_num_samples`.
+            metrics["epoch"] = round(
+                self.completed_steps * self.total_batch_size / self.dataset_num_samples, 2
+            )
             if getattr(self, "_wandb_enabled", False):
                 try:
                     wandb.log(metrics, step=self.completed_steps)
@@ -398,9 +422,19 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
+            logger.info(f"  Dataset samples (1 epoch) = {self.dataset_num_samples}")
+            logger.info(
+                "  Training length = "
+                f"{self.config.trainer.max_train_steps * self.total_batch_size / self.dataset_num_samples:.2f} epochs"
+            )
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
+        anchor_profile = (self.config.framework.get("rmbench_anchor", None) or {}).get("enabled", False)
+        if anchor_profile:
+            import time
+            torch.cuda.synchronize()
+            anchor_step_start = time.perf_counter()
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
@@ -423,12 +457,26 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        return {
+        metrics = {
             "action_dit_loss": action_loss.item(),
         }
+        if anchor_profile:
+            torch.cuda.synchronize()
+            metrics.update({
+                "rmbench_anchor/train_microstep_ms": (time.perf_counter() - anchor_step_start) * 1000,
+                "rmbench_anchor/process_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "rmbench_anchor/process_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+            })
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""
+        # Keep the final step as a regular steps_N checkpoint too: max_train_steps
+        # is derived from num_train_epochs (ceil division) and is almost never a
+        # multiple of save_interval, so the end-of-training state would otherwise
+        # exist only as final_model/ without a step number.
+        if self.completed_steps % self.config.trainer.save_interval != 0:
+            self._save_checkpoint()
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
@@ -462,6 +510,7 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    resolve_max_train_steps(cfg=cfg, dataloader=vla_train_dataloader, accelerator=accelerator)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(

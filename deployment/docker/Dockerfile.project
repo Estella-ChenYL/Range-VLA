@@ -34,10 +34,11 @@ RUN curl -fsSL -o /tmp/miniconda.sh \
 
 # ---- LIBERO evaluation conda env (baked; LIBERO source cloned at eval time) ----
 # Mirrors examples/simBenchmarks/LIBERO/eval_files/install_libero.sh, minus the
-# LIBERO clone (which lives on EFS).
-RUN conda create -n libero python=3.10 -y \
-    && conda run -n libero python -m pip install --no-cache-dir --upgrade pip \
-    && conda run -n libero python -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
+# LIBERO clone (which lives on EFS). conda must be invoked by absolute path:
+# /opt/conda/bin is deliberately NOT on PATH (see above).
+RUN "${CONDA_DIR}/bin/conda" create -n libero python=3.10 -y \
+    && "${CONDA_DIR}/bin/conda" run -n libero python -m pip install --no-cache-dir --upgrade pip \
+    && "${CONDA_DIR}/bin/conda" run -n libero python -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
         mujoco==3.2.3 \
         numpy==1.24.4 \
         tyro \

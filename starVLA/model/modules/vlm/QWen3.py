@@ -4,10 +4,12 @@
 
 from typing import Optional
 
+import inspect
 import torch
+from starVLA.model.modules.vlm.working_memory import apply_history_mrope
 from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (GPU / NPU)
 from starVLA.training.trainer_utils import initialize_overwatch
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 logger = initialize_overwatch(__name__)
@@ -57,12 +59,36 @@ class _QWen3_VL_Interface(nn.Module):
                 print("[WARNING] flash_attn not installed, falling back to sdpa")
                 attn_implementation = "sdpa"
 
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_id,
-            attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
-            ignore_mismatched_sizes=True, # resize image no longer needed? @TODO check bug
-        )
+        load_pretrained_weights = qwenvl_config.get("load_pretrained_weights", True)
+        if load_pretrained_weights:
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_id,
+                attn_implementation=attn_implementation,
+                dtype=torch.bfloat16,
+                ignore_mismatched_sizes=True, # resize image no longer needed? @TODO check bug
+            )
+        else:
+            # Eval / from_pretrained(ckpt): build the architecture only. The
+            # caller applies the training .pt with assign=True. Avoids an extra
+            # 8 GiB HF shard load that was swapping the eval pod.
+            hf_cfg = AutoConfig.from_pretrained(model_id)
+            try:
+                from accelerate import init_empty_weights
+            except ImportError:
+                init_empty_weights = None
+            if init_empty_weights is not None:
+                with init_empty_weights():
+                    model = Qwen3VLForConditionalGeneration._from_config(
+                        hf_cfg,
+                        attn_implementation=attn_implementation,
+                        dtype=torch.bfloat16,
+                    )
+            else:
+                model = Qwen3VLForConditionalGeneration._from_config(
+                    hf_cfg,
+                    attn_implementation=attn_implementation,
+                    dtype=torch.bfloat16,
+                )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
@@ -110,6 +136,51 @@ class _QWen3_VL_Interface(nn.Module):
                 **kwargs,
             )
         return generation_output
+
+    def _maybe_apply_history_mrope(self, batch_inputs: dict, n_images_per_sample: int) -> dict:
+        """WM-v1: rewrite the M-RoPE T channel so the leading history frames sit at
+        T = 0, s, ..., (F-1)*s and the current views share T = F*s.
+
+        Sets batch_inputs["position_ids"], which Qwen3VLForConditionalGeneration
+        respects as-is (it only computes its own when position_ids is None).
+        No-op when framework.working_memory is absent -> legacy behaviour.
+        """
+        wm = (self.config.framework.get("working_memory", None) or {})
+        n_hist = int(wm.get("history_frames", 0) or 0)
+        if n_hist == 0:
+            return batch_inputs
+        n_grid = int(batch_inputs["image_grid_thw"].shape[0])
+        n_samples = int(batch_inputs["input_ids"].shape[0])
+        assert n_grid == n_images_per_sample * n_samples, (
+            f"working_memory layout broken: {n_grid} image grids for "
+            f"{n_samples} samples x {n_images_per_sample} views"
+        )
+        # mm_token_type_ids exists only in newer transformers (5.x). Older versions
+        # (e.g. the training image) neither return it from the processor nor accept
+        # it in get_rope_index -- there, image spans are recovered from input_ids,
+        # which is exactly what the old get_rope_index scans internally.
+        mm_types = batch_inputs.get("mm_token_type_ids")
+        if mm_types is None:
+            input_ids = batch_inputs["input_ids"]
+            mm_types = torch.zeros_like(input_ids)
+            mm_types[(input_ids == IMAGE_TOKEN_INDEX) | (input_ids == VIDEO_TOKEN_INDEX)] = 1
+        rope_fn = self.model.model.get_rope_index
+        rope_kwargs = {
+            "image_grid_thw": batch_inputs.get("image_grid_thw"),
+            "video_grid_thw": batch_inputs.get("video_grid_thw"),
+            "attention_mask": batch_inputs["attention_mask"],
+        }
+        if "mm_token_type_ids" in inspect.signature(rope_fn).parameters:
+            rope_kwargs["mm_token_type_ids"] = mm_types
+        position_ids, _ = rope_fn(batch_inputs["input_ids"], **rope_kwargs)
+        batch_inputs["position_ids"] = apply_history_mrope(
+            position_ids,
+            mm_types,
+            batch_inputs["attention_mask"],
+            history_frames=n_hist,
+            t_stride=int(wm.get("mrope_t_stride", 2)),
+        )
+        return batch_inputs
 
     def build_qwenvl_inputs(self, images, instructions, solutions=None, **kwargs):
         """
@@ -168,6 +239,7 @@ class _QWen3_VL_Interface(nn.Module):
             labels[labels == self.processor.tokenizer.pad_token_id] = -100  ## mask out pad tokens as well
             batch_inputs["labels"] = labels
 
+        batch_inputs = self._maybe_apply_history_mrope(batch_inputs, n_images_per_sample=len(images[0]))
         return batch_inputs.to(self.model.device)
 
 

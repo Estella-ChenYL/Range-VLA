@@ -12,6 +12,7 @@ import websockets.frames
 
 # from openpi_client import base_policy as _base_policy
 from . import msgpack_numpy
+from .dynamic_batcher import DynamicBatcher, log_cuda_peak
 
 
 class WebsocketPolicyServer:
@@ -27,7 +28,10 @@ class WebsocketPolicyServer:
         port: int = 10093,
         idle_timeout: int = -1,  # Idle timeout in seconds, -1 means never auto-close
         metadata: dict | None = None,
+        batch_size: int = 1,
+        batch_wait_ms: int = 20,
     ) -> None:
+        self._batcher = DynamicBatcher(policy, batch_size, batch_wait_ms) if batch_size > 1 else None
         self._policy = policy  #
         self._host = host
         self._port = port
@@ -40,17 +44,21 @@ class WebsocketPolicyServer:
         asyncio.run(self.run())
 
     async def run(self):
-        async with websockets.asyncio.server.serve(
-            self._handler,
-            self._host,
-            self._port,
-            compression=None,
-            max_size=None,
-        ) as server:
-            if self._idle_timeout > 0:
-                await self._idle_watchdog(server)
-            else:
-                await server.serve_forever()
+        try:
+            async with websockets.asyncio.server.serve(
+                self._handler,
+                self._host,
+                self._port,
+                compression=None,
+                max_size=None,
+            ) as server:
+                if self._idle_timeout > 0:
+                    await self._idle_watchdog(server)
+                else:
+                    await server.serve_forever()
+        finally:
+            if self._batcher:
+                await self._batcher.close()
 
     async def _idle_watchdog(self, server):
         """Monitor idle time and shut down the server on timeout."""
@@ -72,7 +80,7 @@ class WebsocketPolicyServer:
             try:
                 msg = msgpack_numpy.unpackb(await websocket.recv())
                 self._last_active = time.time()  # Refresh active time on each received message
-                ret = self._route_message(msg)  # route message
+                ret = await self._route_async(msg, websocket)
                 await websocket.send(packer.pack(ret))
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
@@ -84,6 +92,26 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
+
+    async def _route_async(self, msg, websocket):
+        if self._batcher is None or msg.get("type", "infer") not in ("infer", "predict_action"):
+            return self._route_message(msg)
+        response = {"type": "inference_result", "request_id": msg.get("request_id", "default")}
+        payload = msg.get("payload", {k: v for k, v in msg.items() if k not in ("type", "request_id")})
+        inference = asyncio.create_task(self._batcher.infer(payload))
+        disconnected = asyncio.create_task(websocket.wait_closed())
+        try:
+            done, _ = await asyncio.wait((inference, disconnected), return_when=asyncio.FIRST_COMPLETED)
+            if inference not in done:
+                inference.cancel()
+                return response
+            return dict(response, status="ok", ok=True, data=inference.result())
+        except Exception as error:
+            return dict(response, status="error", ok=False, error={"message": str(error)})
+        finally:
+            inference.cancel()
+            disconnected.cancel()
+            await asyncio.gather(inference, disconnected, return_exceptions=True)
 
     # route logic: recognize request from client
     def _route_message(self, msg: dict) -> dict:
@@ -114,7 +142,11 @@ class WebsocketPolicyServer:
                     "error": {"message": "Payload must be a dict", "payload_type": str(type(payload))},
                 }
             try:
+                started = time.monotonic()
                 output_dict = self._policy.predict_action(**payload)
+                log_cuda_peak()
+                logging.info("inference batch_size=%d batch_limit=1 inference_ms=%.2f",
+                             len(payload.get("examples", [])), (time.monotonic() - started) * 1000)
             except Exception as e:
                 logging.exception("Policy inference error (request_id=%s)", req_id)
                 logging.exception(e)

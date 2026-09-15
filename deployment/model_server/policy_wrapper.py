@@ -65,9 +65,12 @@ class PolicyServerWrapper:
 
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
         framework = baseframework.from_pretrained(self._ckpt_path, config_overrides=config_overrides)
+        logging.info("PolicyServerWrapper: from_pretrained done; moving to device=%s bf16=%s", device, use_bf16)
         if use_bf16:
             framework = framework.to(torch.bfloat16)
+            logging.info("PolicyServerWrapper: bf16 cast done")
         framework = framework.to(device).eval()
+        logging.info("PolicyServerWrapper: model on device=%s", device)
         self._framework = framework
 
         # Co-located metadata.
@@ -151,6 +154,12 @@ class PolicyServerWrapper:
                 "The server does not infer or reorder camera views from training config."
             ),
         }
+        wm = self._model_cfg.get("framework", {}).get("working_memory", {}) or {}
+        base["training_working_memory"] = dict(wm)
+        anchor = self._model_cfg.get("framework", {}).get("rmbench_anchor", {}) or {}
+        if anchor.get("enabled", False):
+            from examples.simBenchmarks.RMBench.anchor_memory import memory_contract
+            base["rmbench_anchor"] = memory_contract(self._model_cfg["framework"])
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
             proc = self._get_processor(self._default_unnorm_key)
@@ -187,6 +196,16 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
+        anchor_contract = self.metadata.get("rmbench_anchor")
+        if anchor_contract:
+            from examples.simBenchmarks.RMBench.anchor_memory import frame_ids
+            for example in examples:
+                metadata = example.get("rmbench_memory", {})
+                ids = metadata.get("frame_ids", [])
+                if (len(example["image"]) != len(anchor_contract["image_roles"])
+                        or metadata.get("image_roles") != anchor_contract["image_roles"]
+                        or not ids or ids != frame_ids(ids[-1], anchor_contract)):
+                    raise ValueError("RMBench anchor request does not match the checkpoint's episode/WM layout")
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
@@ -194,4 +213,7 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        return {"actions": unnorm}
+        result = {"actions": unnorm}
+        if anchor_contract:
+            result["rmbench_visual_layout"] = self._framework.qwen_vl_interface.last_visual_layout
+        return result

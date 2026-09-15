@@ -259,3 +259,6 @@ examples/realRobots/UnitreeG1_WholeBody/sdk_tools/Jinhui.sh
 examples/realRobots/UnitreeG1_WholeBody/step3_deployment/eval_files/local_self_test.py
 examples/realRobots/UnitreeG1_WholeBody/sdk_tools/SonicStar
 examples/realRobots/UnitreeG1_WholeBody/sdk_tools/sonicstar_wbc_deployment_reference
+
+# Local secrets for submit_train_*.sh (never commit)
+.env.submit

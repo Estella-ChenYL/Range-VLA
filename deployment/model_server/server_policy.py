@@ -18,6 +18,10 @@ def main(args) -> None:
     eval clients (LIBERO / SimplerEnv / etc.) just need to forward `examples`
     and consume already-unnormalized actions from the response.
     """
+    batch_size = vars(args).get("batch_size", 1)
+    batch_wait_ms = vars(args).get("batch_wait_ms", 20)
+    if batch_size < 1 or batch_wait_ms < 0:
+        raise ValueError("batch_size must be positive and batch_wait_ms nonnegative")
     config_overrides = getattr(args, "config_override", [])
     if config_overrides:
         override_keys = [item.split("=", 1)[0] for item in config_overrides]
@@ -63,6 +67,8 @@ def main(args) -> None:
         port=args.port,
         idle_timeout=args.idle_timeout,
         metadata=wrapper.metadata,
+        batch_size=batch_size,
+        batch_wait_ms=batch_wait_ms,
     )
     logging.info("server running ... metadata=%s", wrapper.metadata)
     server.serve_forever()
@@ -71,6 +77,8 @@ def main(args) -> None:
 def build_argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_wait_ms", type=int, default=20)
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")

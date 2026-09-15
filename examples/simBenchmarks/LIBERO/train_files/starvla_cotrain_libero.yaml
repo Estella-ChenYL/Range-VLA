@@ -16,6 +16,11 @@ framework:
     action_dim: 7
     state_dim: 7
     action_horizon: 8
+  working_memory:
+    history_frames: 4        # history frames (excluding the current observation)
+    history_stride: 2        # deltas [-8,-6,-4,-2,0], covers 8 env steps back
+    history_image_size: 112  # history frames resized to 112x112 (current views stay 224)
+    mrope_t_stride: 2        # T axis: history frame i -> T=i*2, current views -> T=8
 
 datasets:
   vlm_data:

@@ -8,6 +8,7 @@ Note: No device placement or optimizer concerns handled here (delegated to train
 
 import importlib
 import pkgutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 from omegaconf import OmegaConf
@@ -22,6 +23,24 @@ from starVLA.training.trainer_utils import initialize_overwatch
 
 logger = initialize_overwatch(__name__)
 _FRAMEWORKS_IMPORTED = False
+
+
+def apply_checkpoint_state_dict(module: torch.nn.Module, state_dict: Dict[str, Any], *, strict: bool = True) -> None:
+    """Attach checkpoint tensors to ``module`` without a full memcpy.
+
+    A per-tensor ``copy_`` of the 10 GiB QwenPI_v3 ckpt ran at ~2.5 s/tensor
+    on the eval pod (400/1386 in 1062 s, then the 1800 s wait killed it).
+    ``assign=True`` swaps storage pointers instead of allocating a third copy
+    (which was driving the process into swap).
+    """
+    t0 = time.time()
+    logger.info(f"load_state_dict(assign=True) for {len(state_dict)} tensors")
+    try:
+        module.load_state_dict(state_dict, strict=strict, assign=True)
+    except TypeError:
+        logger.info("assign=True not supported; falling back to load_state_dict copy")
+        module.load_state_dict(state_dict, strict=strict)
+    logger.info(f"load_state_dict finished in {time.time() - t0:.1f}s")
 
 
 def merge_config_overrides(model_config: dict, config_overrides: Sequence[str] | None = None) -> dict:
@@ -288,34 +307,31 @@ class baseframework(PreTrainedModel):
         config = dict_to_namespace(model_config)
         model_config = config
         model_config.trainer.pretrained_checkpoint = None
+        # The training .pt already contains the VLM weights. Loading the HF
+        # base VLM first (~8 GiB) then memcpy-ing the 10 GiB ckpt on top is
+        # what pushed the last eval pod into swap (~2.5 s/tensor).
+        if "qwenvl" in model_config.framework:
+            model_config.framework.qwenvl.load_pretrained_weights = False
+            logger.info("skipping HF VLM weight download; will apply the training checkpoint")
 
         FrameworkModel = build_framework(cfg=model_config)
         # set for action un-norm
         FrameworkModel.norm_stats = norm_stats
         # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
+        ckpt_gb = pretrained_checkpoint.stat().st_size / (1024 ** 3)
+        logger.info(f"Loading model weights from `{pretrained_checkpoint}` ({ckpt_gb:.2f} GiB)")
         if pretrained_checkpoint.suffix == ".safetensors":
             from safetensors.torch import load_file
 
             model_state_dict = load_file(str(pretrained_checkpoint))
         else:
             model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
-        # logger.info(f"Loading model weights from `{pretrained_checkpoint}`")
-        model_keys = set(FrameworkModel.state_dict().keys())
-        checkpoint_keys = set(model_state_dict.keys())
-        try:
-            FrameworkModel.load_state_dict(model_state_dict, strict=True)
-        except RuntimeError as e:
-            # must keep all keys matched
-            common_keys = model_keys.intersection(checkpoint_keys)
-            missing_keys = model_keys - common_keys
-            unexpected_keys = checkpoint_keys - common_keys
-            if missing_keys:
-                logger.warning(f"Missing keys in state_dict: {missing_keys}")
-            if unexpected_keys:
-                logger.warning(f"Unexpected keys in state_dict: {unexpected_keys}")
-
-            raise e
-
-        # **ensure model is on GPU**
-        FrameworkModel = FrameworkModel
+        logger.info(f"state_dict loaded ({len(model_state_dict)} tensors); applying to model")
+        first_param = next(FrameworkModel.parameters(), None)
+        if first_param is not None and first_param.device.type != "meta":
+            logger.info(f"moving constructed model to CPU (was {first_param.device})")
+            FrameworkModel.cpu()
+        apply_checkpoint_state_dict(FrameworkModel, model_state_dict, strict=True)
+        del model_state_dict
+        logger.info("state_dict applied; ckpt tensors released")
         return FrameworkModel

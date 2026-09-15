@@ -15,6 +15,7 @@ from starVLA.dataloader.gr00t_lerobot.registry import (
     DATASET_NAMED_MIXTURES,
     EmbodimentTag,
 )
+from starVLA.model.modules.vlm.working_memory import history_delta_indices
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ def make_LeRobotSingleDataset(
     robot_type: str,
     delete_pause_frame: bool = False,
     data_cfg: dict | None = None,
+    wm_cfg: dict | None = None,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -40,6 +42,13 @@ def make_LeRobotSingleDataset(
     
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
     modality_config = data_config.modality_config()
+    n_hist = int((wm_cfg or {}).get("history_frames", 0) or 0)
+    if n_hist > 0:
+        stride = int(wm_cfg.get("history_stride", 2))
+        # Applies to every video key: the history view uses all frames, the
+        # other views take the current (last) frame in _pack_sample. Wrist
+        # decode overhead of the extra frames is accepted for v1 simplicity.
+        modality_config["video"].delta_indices = history_delta_indices(n_hist, stride)
     transforms = data_config.transform()
     dataset_path = data_root_dir / data_name
     embodiment_tag = getattr(data_config, "embodiment_tag", None)
@@ -53,7 +62,7 @@ def make_LeRobotSingleDataset(
     # to swap in a custom dataset class (e.g. with per-task filtering / chunk stride).
     # When absent, fall through to the default LeRobotSingleDataset construction below.
     if hasattr(data_config, "make_dataset"):
-        return data_config.make_dataset(
+        dataset = data_config.make_dataset(
             dataset_path=dataset_path,
             modality_configs=modality_config,
             transforms=transforms,
@@ -63,8 +72,10 @@ def make_LeRobotSingleDataset(
             data_cfg=data_cfg,
             dataset_name=data_name,
         )
+        dataset.wm_cfg = wm_cfg
+        return dataset
 
-    return LeRobotSingleDataset(
+    dataset = LeRobotSingleDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
         transforms=transforms,
@@ -73,6 +84,8 @@ def make_LeRobotSingleDataset(
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
     )
+    dataset.wm_cfg = wm_cfg
+    return dataset
 
 def get_vla_dataset(
     data_cfg: dict,
@@ -80,6 +93,7 @@ def get_vla_dataset(
     balance_dataset_weights: bool = False,
     balance_trajectory_weights: bool = False,
     seed: int = 42,
+    wm_cfg: dict | None = None,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
     """
@@ -102,7 +116,7 @@ def get_vla_dataset(
 
     dataset_mixture = []
     for d_name, d_weight, robot_type in filtered_mixture_spec:
-        dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, delete_pause_frame=delete_pause_frame, data_cfg=data_cfg), d_weight))
+        dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, delete_pause_frame=delete_pause_frame, data_cfg=data_cfg, wm_cfg=wm_cfg), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,

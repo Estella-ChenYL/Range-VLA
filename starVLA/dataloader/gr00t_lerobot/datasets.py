@@ -51,6 +51,7 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+from starVLA.model.modules.vlm.working_memory import pack_step_images
 
 from functools import partial
 from typing import Tuple, List
@@ -593,6 +594,7 @@ class LeRobotSingleDataset(Dataset):
         """
         # first check if the path directory exists
         self.data_cfg = data_cfg
+        self.wm_cfg = None  # set by the factory; None = legacy single-frame behaviour
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # indict letobot version
@@ -1378,11 +1380,11 @@ class LeRobotSingleDataset(Dataset):
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
-        step_images = []
-        for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+        step_images = pack_step_images(
+            frames_by_key={k: data[k] for k in self.modality_keys["video"]},
+            video_keys=list(self.modality_keys["video"]),
+            wm_cfg=getattr(self, "wm_cfg", None),
+        )
 
         language = data[self.modality_keys["language"][0]][0]
         action = []

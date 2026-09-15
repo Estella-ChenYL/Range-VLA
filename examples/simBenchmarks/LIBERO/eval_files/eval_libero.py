@@ -58,6 +58,10 @@ class Args:
 
     job_name: str = "test"
 
+    history_frames: int = 0  # set to 4 (or the training value) when evaluating WM-trained checkpoints
+    history_stride: int = 2
+    history_image_size: tuple = (112, 112)
+
 
 def eval_libero(args: Args) -> None:
     logging.info(f"Arguments: {json.dumps(dataclasses.asdict(args), indent=4)}")
@@ -92,6 +96,9 @@ def eval_libero(args: Args) -> None:
         host=args.host,
         port=args.port,
         unnorm_key=args.unnorm_key,
+        history_frames=args.history_frames,
+        history_stride=args.history_stride,
+        history_image_size=args.history_image_size,
     )
 
     # Optional smoke-test cap (still useful for quick verification with -1 = full run).

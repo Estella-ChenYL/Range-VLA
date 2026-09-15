@@ -35,14 +35,22 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
 
-    if dataset_py == "lerobot_datasets":
+    if dataset_py in ("lerobot_datasets", "rmbench_anchor"):
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
 
+        dataset_options = {}
+        if dataset_py == "rmbench_anchor":
+            from examples.simBenchmarks.RMBench.train_files.anchor_dataset import get_vla_dataset
+            dataset_options["anchor_cfg"] = cfg.framework.get("rmbench_anchor", None)
+
+        wm_cfg = cfg.framework.get("working_memory", None) if hasattr(cfg, "framework") else None
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             balance_dataset_weights=vla_dataset_cfg.get("balance_dataset_weights", False),
             balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
+            wm_cfg=wm_cfg,
+            **dataset_options,
         )
         num_workers = int(vla_dataset_cfg.get("num_workers", 4))
         dataloader_kwargs = {

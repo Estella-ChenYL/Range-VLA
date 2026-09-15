@@ -23,6 +23,7 @@ from PIL import Image
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 from examples.simBenchmarks.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
+from starVLA.model.modules.vlm.working_memory import select_history_indices
 
 
 class ModelClient:
@@ -39,6 +40,9 @@ class ModelClient:
         host: str = "0.0.0.0",
         port: int = 10095,
         image_size: Sequence[int] = (224, 224),
+        history_frames: int = 0,
+        history_stride: int = 2,
+        history_image_size: Sequence[int] = (112, 112),
     ) -> None:
         # Connect & receive handshake metadata (action_chunk_size, etc.)
         self.client = WebsocketClientPolicy(host, port)
@@ -70,7 +74,11 @@ class ModelClient:
         self.previous_gripper_action = None
 
         self.task_description = None
-        self.image_history = deque(maxlen=self.horizon)
+        self.history_frames = int(history_frames)
+        self.history_stride = int(history_stride)
+        self.history_image_size = tuple(history_image_size)
+        wm_maxlen = self.history_frames * self.history_stride + 1 if self.history_frames > 0 else self.horizon
+        self.image_history = deque(maxlen=wm_maxlen)
         if self.action_ensemble:
             self.action_ensembler = AdaptiveEnsembler(
                 self.action_ensemble_horizon, self.adaptive_ensemble_alpha
@@ -85,6 +93,26 @@ class ModelClient:
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
         self.num_image_history = min(self.num_image_history + 1, self.horizon)
+
+    def _prepend_history(self, images: list) -> list:
+        """Prepend [hist_0..hist_{F-1}] (oldest->newest, 112x112) to the current views.
+
+        Index math mirrors the training dataloader's clamp: before enough
+        history exists the earliest buffered frame is duplicated (at episode
+        start that is the current observation).
+        """
+        n = len(self.image_history)
+        hist = []
+        for idx in select_history_indices(n, self.history_frames, self.history_stride):
+            arr = np.asarray(self.image_history[idx])
+            if arr.shape[:2] != self.history_image_size:
+                arr = np.asarray(
+                    Image.fromarray(arr).resize(
+                        (self.history_image_size[1], self.history_image_size[0]), Image.BILINEAR
+                    )
+                )
+            hist.append(arr)
+        return hist + list(images)
 
     def reset(self, task_description: str) -> None:
         self.task_description = task_description
@@ -127,8 +155,13 @@ class ModelClient:
                 resized.append(arr)
             example = {**example, "image": resized}
 
+        if self.history_frames > 0 and example.get("image"):
+            self._add_image_to_history(np.asarray(example["image"][0]))
+
         # Refresh chunk if needed.
         if step % self.action_chunk_size == 0 or self.raw_actions is None:
+            if self.history_frames > 0:
+                example = {**example, "image": self._prepend_history(example["image"])}
             vla_input = {
                 "examples": [example],
                 "unnorm_key": self.unnorm_key,

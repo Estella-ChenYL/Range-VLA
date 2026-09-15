@@ -2,6 +2,12 @@ def get_vlm_model(config):
 
     vlm_name = config.framework.qwenvl.base_vlm
 
+    if (config.framework.get("rmbench_anchor", None) or {}).get("enabled", False):
+        if "Qwen3-VL" not in vlm_name or config.datasets.vla_data.dataset_py != "rmbench_anchor":
+            raise ValueError("RMBench anchor requires Qwen3-VL and the rmbench_anchor dataset")
+        from examples.simBenchmarks.RMBench.anchor_vlm import RMBenchAnchorQwenVL
+        return RMBenchAnchorQwenVL(config)
+
     if "Qwen2.5-VL" in vlm_name or "nora" in vlm_name.lower():  # temp for some ckpt
         from .QWen2_5 import _QWen_VL_Interface
 

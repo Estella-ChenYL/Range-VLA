@@ -1,0 +1,124 @@
+# syntax=docker/dockerfile:1
+# starVLA RMBench eval image: built FROM the training image (Dockerfile.train),
+# adds the RMBench (RoboTwin 2.0) simulation environment.
+#
+# Build (from the repository root, after Dockerfile.train):
+#   docker build -f deployment/docker/Dockerfile.rmbench_eval -t starvla-rmbench-eval:latest .
+#
+# The training env is the base image's system Python (Python 3.10, torch 2.6
+# cu124, deepspeed, flash-attn) and runs the policy server. RMBench sim needs a
+# *separate* conda env `rmbench` because upstream pins torch==2.4.1 +
+# sapien==3.0.0b1, which conflict with the training pins. The RMBench *source*
+# and its assets are NOT baked here — they are synced to S3 and materialized
+# onto EFS at eval time (see eval_files/run_rmbench_eval_in_pod.sh), so sim
+# code can be patched without rebuilding the image.
+#
+# Mirrors /code/RMBench/script/_install.sh (upstream), with two deviations:
+#   - curobo is cloned to a fixed in-image path (/opt/rmbench-deps/curobo)
+#     instead of envs/, so the `pip install -e` egg-link never points at EFS
+#     (shared, mutated per pod -> would race).
+#   - azure / azure-ai-inference / openai are dropped: they are only used by
+#     description *generation*, not by eval (verified: no imports under envs/
+#     or script/eval_policy.py).
+
+FROM starvla-train:latest
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG CONDA_VERSION=py310_24.9.2-0
+ARG CUROBO_VERSION=v0.7.8
+
+ENV PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=8
+ENV CONDA_DIR=/opt/conda
+# Do NOT prepend /opt/conda/bin to PATH at image level: the training image's
+# system Python (torch + starVLA + flash-attn) must stay the default `python`
+# for the policy server. The rmbench env is invoked explicitly via
+# /opt/conda/envs/rmbench/bin/python.
+
+# Miniconda (Python 3.10 base). curl is already present in the base image.
+RUN curl -fsSL -o /tmp/miniconda.sh \
+        "https://repo.anaconda.com/miniconda/Miniconda3-${CONDA_VERSION}-Linux-x86_64.sh" \
+    && bash /tmp/miniconda.sh -b -p "${CONDA_DIR}" \
+    && rm -f /tmp/miniconda.sh \
+    && "${CONDA_DIR}/bin/conda" init bash \
+    && "${CONDA_DIR}/bin/conda" config --set always_yes yes
+
+# sapien 3.0 renders through Vulkan (headless, offscreen); the NVIDIA ICD is
+# injected by the container toolkit at runtime, the image only needs the loader.
+# ffmpeg (with libx264) is spawned as a subprocess by eval_policy.py for videos.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libvulkan1 \
+        vulkan-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- RMBench sim conda env ----
+# torch in its own layer (cu121 wheel, ~2.5GB, dominates download size).
+RUN "${CONDA_DIR}/bin/conda" create -n rmbench python=3.10 -y \
+    && "${CONDA_DIR}/bin/conda" run -n rmbench python -m pip install --no-cache-dir --upgrade pip \
+    && "${CONDA_DIR}/bin/conda" run -n rmbench python -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
+        torch==2.4.1 \
+        torchvision
+
+# Upstream script/requirements.txt, minus azure/openai (see header).
+# websockets + imageio-ffmpeg added: the starVLA eval client transport and the
+# video pipeline respectively.
+RUN "${CONDA_DIR}/bin/conda" run -n rmbench python -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
+        transforms3d==0.4.2 \
+        sapien==3.0.0b1 \
+        scipy==1.10.1 \
+        mplib==0.2.1 \
+        gymnasium==0.29.1 \
+        trimesh==4.4.3 \
+        open3d==0.18.0 \
+        imageio==2.34.2 \
+        pydantic \
+        zarr \
+        huggingface_hub==0.25.0 \
+        h5py \
+        "pyglet<2" \
+        wandb \
+        moviepy \
+        termcolor \
+        av \
+        matplotlib \
+        websockets \
+        msgpack \
+        imageio-ffmpeg
+
+# pytorch3d: imported by envs/camera/camera.py. Compiled against the env's
+# torch 2.4.1; --no-build-isolation keeps the build on that torch (build
+# isolation would pull a mismatched latest torch). Restricting the arch list
+# keeps the compile time bounded.
+RUN TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;9.0" \
+    "${CONDA_DIR}/bin/conda" run -n rmbench python -m pip install --no-cache-dir \
+        --no-build-isolation \
+        "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
+# curobo: imported by envs/robot/planner.py + robot.py (expert seed planning in
+# eval_policy.py's play_once). Source baked at a fixed path so the editable
+# install stays valid for every pod. TORCH_CUDA_ARCH_LIST is required: the
+# build node has no GPU, and torch's arch autodetect would return an empty
+# list (arch_list[-1] IndexError in cpp_extension).
+RUN git clone --branch ${CUROBO_VERSION} --depth 1 https://github.com/NVlabs/curobo.git \
+        /opt/rmbench-deps/curobo \
+    && TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;9.0" \
+        "${CONDA_DIR}/bin/conda" run -n rmbench python -m pip install --no-cache-dir \
+        --no-build-isolation -e /opt/rmbench-deps/curobo \
+    && "${CONDA_DIR}/bin/conda" run -n rmbench python -m pip install --no-cache-dir -i ${PIP_INDEX_URL} \
+        warp-lang==1.12.0 \
+        setuptools==69.5.1
+
+# Upstream compatibility patches (script/_install.sh):
+#   1. sapien urdf_loader: open(..., "r") -> encoding="utf-8" (URDF with UTF-8
+#      comments crashes the default locale-less open in containers).
+#   2. mplib planner: drop `or collide` so near-collision screw plans still
+#      return a path (upstream RMBench/RoboTwin behaviour).
+RUN SAPIEN_DIR=$("${CONDA_DIR}/bin/conda" run -n rmbench python -m pip show sapien | awk '/^Location:/{print $2}')/sapien \
+    && sed -i -E 's/("r")(\))( as)/\1, encoding="utf-8") as/g' "${SAPIEN_DIR}/wrapper/urdf_loader.py" \
+    && grep -q 'encoding="utf-8"' "${SAPIEN_DIR}/wrapper/urdf_loader.py" \
+    && MPLIB_DIR=$("${CONDA_DIR}/bin/conda" run -n rmbench python -m pip show mplib | awk '/^Location:/{print $2}')/mplib \
+    && sed -i -E 's/(if np.linalg.norm\(delta_twist\) < 1e-4 )(or collide )(or not within_joint_limit:)/\1\3/g' "${MPLIB_DIR}/planner.py" \
+    && ! grep -q 'or collide' "${MPLIB_DIR}/planner.py"
+
+CMD ["/bin/bash"]

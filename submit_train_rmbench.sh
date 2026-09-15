@@ -1,4 +1,23 @@
 #!/usr/bin/env bash
+# Submit RMBench (QwenPI_v3) training to KOALA as a Kubeflow PyTorchJob.
+#
+# Pipeline:
+#   BUILD_IMAGE=1  -> ECR login + build/push the :rmbench image (h5py added in
+#                     requirements.txt)
+#   SYNC_RAW=1     -> upload the raw 37GB HDF5 data to the S3 asset bucket
+#                     （已提交）(注：仅第一次运行需要提交，之后再提交会累积)
+#   (in pod)       -> run_rmbench_train_in_pod.sh converts raw -> LeRobot on
+#                     /local-ssd if the converted asset is missing, pushes the
+#                     result back to S3, then trains
+#  # 本地目录：提交时自动上传到 S3 asset
+#   TRAIN_TASK=battery_try RESUME_CKPT=/data/old_run bash submit_train_rmbench.sh
+
+#   # S3：pod 内下载
+#   TRAIN_TASK=battery_try RESUME_CKPT=s3://bucket/path/old_run bash submit_train_rmbench.sh
+
+#   # EFS：直接读取
+#   TRAIN_TASK=battery_try RESUME_CKPT=/efs/user/old_run bash submit_train_rmbench.sh
+
 set -Eeuo pipefail
 
 log() {
@@ -12,10 +31,17 @@ die() {
 
 trap 'rc=$?; echo "[$(date "+%F %T")] [ERROR] submit failed at line ${LINENO} with exit ${rc}" >&2' ERR
 
+# ---- Optional local env file (gitignored; keeps secrets out of this script) ----
+if [ -f .env.submit ]; then
+    log "sourcing .env.submit"
+    set -a; # shellcheck disable=SC1091
+    . ./.env.submit; set +a
+fi
+
 # ---- KOALA / identity ----
 KOALA_CLUSTER=${KOALA_CLUSTER:-tenc-aws-yfxn-northeast}
 NAMESPACE=${NAMESPACE:-helix}
-KOALA_TOKEN=${KOALA_TOKEN:?"KOALA_TOKEN not set"}
+KOALA_TOKEN=${KOALA_TOKEN:-}
 SUBMIT_USER=${SUBMIT_USER:-danyangchen}
 
 # ---- Storage / experiment owners ----
@@ -34,8 +60,8 @@ TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
 CUSTOM_JOB_NAME=${CUSTOM_JOB_NAME:-train}
 JOB_NAME="${CUSTOM_JOB_NAME}-$(date +%Y%m%d%H%M)"
 RUN_NAME=${RUN_NAME:-"${CUSTOM_JOB_NAME}-${TIMESTAMP}"}
-# k8s object names must be lowercase RFC 1123. A capital letter (e.g. CUSTOM_JOB_NAME=Fr-L35)
-# is rejected by the API server AFTER the code+asset sync has already run, wasting minutes.
+# k8s object names must be lowercase RFC 1123. A capital letter is rejected by
+# the API server AFTER the code+asset sync has already run, wasting minutes.
 # Lowercase it here and say so, rather than failing several steps later.
 _job_name_lc=$(printf '%s' "${JOB_NAME}" | tr '[:upper:]' '[:lower:]')
 if [ "${_job_name_lc}" != "${JOB_NAME}" ]; then
@@ -46,13 +72,14 @@ fi
 if ! printf '%s' "${JOB_NAME}" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'; then
     die "job name '${JOB_NAME}' is not a valid RFC 1123 subdomain (allowed: a-z 0-9 '-' '.', must start/end alphanumeric). Fix CUSTOM_JOB_NAME."
 fi
-IMAGE=${IMAGE:-600627331169.dkr.ecr.ap-northeast-1.amazonaws.com/danyangchen/starvla:latest}
+# Distinct tag so rebuilding for RMBench can never break in-flight LIBERO jobs
+# that pull :latest (imagePullPolicy: Always).
+IMAGE=${IMAGE:-600627331169.dkr.ecr.ap-northeast-1.amazonaws.com/danyangchen/starvla:rmbench}
 
-# ---- Compute: one node, configurable GPU count (default 8) ----
-# Example: NPROC_PER_NODE=4 bash submit_train_libero.sh
+# ---- Compute: one node, configurable GPU count ----
 NODE_NUM=${NODE_NUM:-1}
 WORKER_NODE_NUM=$((NODE_NUM - 1))
-NPROC_PER_NODE=${NPROC_PER_NODE:-1}
+NPROC_PER_NODE=${NPROC_PER_NODE:-6}
 GPU_LIMIT=${GPU_LIMIT:-${NPROC_PER_NODE}}
 # EFA is only needed for multi-node jobs (cross-node RDMA). Single-node jobs
 # use NVLink/PCIe and don't need EFA — requesting it blocks scheduling when
@@ -69,287 +96,159 @@ CPU_LIMIT=${CPU_LIMIT:-${_cpu_default}}
 MEMORY_LIMIT=${MEMORY_LIMIT:-"${_mem_default}Gi"}
 
 # ---- Code path (timestamped snapshot, isolated per submit) ----
-AWS_S3_RUN_CODE_SYNC_DIR="s3://${CODE_BUCKET_NAME}/${SUBMIT_USER}/starvla-train/${TIMESTAMP}"
-AWS_S3_RUN_CODE_DIR="/threed-code/${SUBMIT_USER}/starvla-train/${TIMESTAMP}"
+AWS_S3_RUN_CODE_SYNC_DIR="s3://${CODE_BUCKET_NAME}/${SUBMIT_USER}/starvla-rmbench-train/${TIMESTAMP}"
+AWS_S3_RUN_CODE_DIR="/threed-code/${SUBMIT_USER}/starvla-rmbench-train/${TIMESTAMP}"
 INIT_CMD="set -euo pipefail; cp -r ${AWS_S3_RUN_CODE_DIR} /data/work/starvla; chmod -R 755 /data/work/starvla"
 
 # ---- Asset layout: ckpt + data live in the asset bucket/PVC ----
 STARVLA_ASSET_ROOT=${STARVLA_ASSET_ROOT:-/asset/${ASSET_USER}/starVLA}
 S3_ASSET_PREFIX="s3://${ASSET_BUCKET_NAME}/${ASSET_USER}/starVLA"
 
-# ---- Training defaults (confirmed config: QwenPI_v3 + libero_all) ----
-Framework_name=${Framework_name:-QwenPI_v3}
-# Which submodules to freeze. Default matches the yaml (freeze the pretrained VLM,
-# train the action head + projector; WM-v1 adds no trainable parameters).
-# Set freeze_module_list='' explicitly to full-finetune the VLM on purpose.
-freeze_module_list=${freeze_module_list-qwen_vl_interface}
+# Raw RMBench data on the submit host (HF TianxingChen/RMBench, demo_clean).
+RMBENCH_RAW_LOCAL=${RMBENCH_RAW_LOCAL:-/data/starVLA/RMBench}
+
+# ---- Training defaults (confirmed config: QwenPI_v3 + rmbench_all) ----
 base_vlm=${base_vlm:-playground/Pretrained_models/Qwen3-VL-4B-Instruct}
-config_yaml=${config_yaml:-./examples/simBenchmarks/LIBERO/train_files/starvla_cotrain_libero.yaml}
-libero_data_root=${libero_data_root:-playground/Datasets/LEROBOT_LIBERO_DATA}
-data_mix=${data_mix:-libero_all}
-per_device_bs=${per_device_bs:-16}
-# Training length is epoch-based: the trainer derives max_train_steps from the real
-# dataset size and the effective global batch size (resolve_max_train_steps), so the
-# budget is unchanged if per_device_bs / GPU count / data_mix change.
-# libero_all = 273,465 frames -> 10 epochs = 21,365 steps at 8 GPUs x bs16 x ga1
-# (42,729 steps at 4 GPUs -- derived automatically).
-num_train_epochs=${num_train_epochs:-10}
-# Working memory A/B: false -> history_frames=0, bit-identical to the no-history baseline.
-working_memory_enabled=${working_memory_enabled:-true}
-if [ "${working_memory_enabled}" = "true" ]; then
-    wm_history_frames=${wm_history_frames:-4}
-else
-    wm_history_frames=0
-fi
-save_interval=${save_interval:-2000}
-logging_frequency=${logging_frequency:-100}
-# NOTE: eval_action_model() consumes a training batch each time it fires, so keep
-# this interval coarse.
+config_yaml=${config_yaml:-./examples/simBenchmarks/RMBench/train_files/starvla_qwenpiv3_rmbench.yaml}
+rmbench_data_root=${rmbench_data_root:-playground/Datasets/rmbench_lerobot}
+data_mix=${data_mix:-rmbench_all}
+# Per RMBench protocol, one policy is trained per task. The pod loops this
+# list sequentially (own run_id/ckpt per task). Default: the 9-task sweep
+# (excludes classify_blocks / storage_blocks / place_block_mat).
+# TRAIN_TASK (singular) is accepted as an alias. Examples:
+#   TRAIN_TASK=battery_try CUSTOM_JOB_NAME=train-task1 bash submit_train_rmbench.sh
+#   TRAIN_TASKS="battery_try cover_blocks" bash submit_train_rmbench.sh
+TRAIN_TASKS=${TRAIN_TASKS:-${TRAIN_TASK:-"battery_try blocks_ranking_try observe_and_pickup cover_blocks press_button put_back_block rearrange_blocks swap_blocks swap_T"}}
+# Fail fast on typos at submit time (free) instead of in-pod after minutes of
+# setup. Valid names = the 12 converted tasks (data_registry/RMBENCH_TASKS).
+_valid_tasks="battery_try blocks_ranking_try classify_blocks  observe_and_pickup cover_blocks place_block_mat press_button put_back_block rearrange_blocks storage_blocks swap_blocks swap_T"
+for _t in ${TRAIN_TASKS}; do
+    case " ${_valid_tasks} " in
+        *" ${_t} "*) ;;
+        *) die "unknown task '${_t}' in TRAIN_TASKS. Valid: ${_valid_tasks}" ;;
+    esac
+done
+# Full fine-tune of the 4B VLM + WM (7 images/sample) OOMs at bs~60-100 on
+# 2 GPUs. 16 is a safe default; raise cautiously, or use
+# gradient_accumulation_steps for a bigger global batch.
+per_device_bs=${per_device_bs:-26}
+# Which submodules to freeze. Default '' = full fine-tune, matching the yaml
+# (freeze_modules: "") and the repo's Robotwin example: RMBench is a new
+# dual-arm Agilex embodiment on a raw Qwen3-VL backbone, so the VLM must adapt
+# too.
+freeze_module_list=${freeze_module_list-}
+# Training length is epoch-based: the trainer derives max_train_steps from the
+# real dataset size and the effective global batch size, so the budget is
+# unchanged if per_device_bs / GPU count / data_mix change.
+num_train_epochs=${num_train_epochs:-500}
+save_interval=${save_interval:-3000}
+logging_frequency=${logging_frequency:-20}
+# NOTE: eval_action_model() consumes a training batch each time it fires, so
+# keep this interval coarse.
 eval_interval=${eval_interval:-2000}
-wandb_project=${wandb_project:-starVLA_Libero}
+wandb_project=${wandb_project:-starVLA_rmbench}
 # Checkpoint output on the EFS PVC (persists after pod termination).
 run_root_dir=${run_root_dir:-/efs/${ASSET_USER}/exp/starvla}
 run_id=${RUN_NAME}
 # Background S3 mirror interval (seconds).
-CKPT_MIRROR_INTERVAL=${CKPT_MIRROR_INTERVAL:-300}
+CKPT_MIRROR_INTERVAL=${CKPT_MIRROR_INTERVAL:-1000}
 # S3 prefix checkpoints are mirrored to.
 S3_CHECKPOINT_DIR="s3://${ASSET_BUCKET_NAME}/${ASSET_USER}/starVLA/exp/${RUN_NAME}"
 
-START_CMD=$(cat <<'EOS'
-set -Eeuo pipefail
-
-log() {
-    echo "[$(date '+%F %T')] $*"
-}
-
-MIRROR_PID=""
-cleanup() {
-    if [ -n "${MIRROR_PID}" ] && kill -0 "${MIRROR_PID}" 2>/dev/null; then
-        kill "${MIRROR_PID}" 2>/dev/null || true
-    fi
-}
-
-trap 'rc=$?; cleanup; log "[ERROR] container failed at line ${LINENO} with exit ${rc}"; exit ${rc}' ERR
-trap 'cleanup' EXIT
-
-log "job=${JOB_NAME:-unknown} start (nproc=${NPROC_PER_NODE:-8})"
-
-# ---- Step 0: ensure aws CLI is available for checkpoint mirroring ----
-if ! command -v aws >/dev/null 2>&1; then
-    log "[0/5] installing awscli (aws not on PATH)"
-    _t0=$SECONDS
-    pip install --quiet awscli \
-        && log "[0/5] awscli installed ($((SECONDS - _t0))s): $(aws --version 2>&1)" \
-        || log "[WARN] awscli install failed; checkpoint S3 mirroring will be skipped"
-else
-    log "[0/5] aws already on PATH: $(aws --version 2>&1)"
+# Resume one task from a run directory, checkpoints directory, or steps_N file.
+# Local paths upload to the asset bucket; s3:// paths download inside the pod;
+# /efs/... paths are read directly. num_train_epochs remains the TOTAL budget.
+# Example: TRAIN_TASK=battery_try RESUME_CKPT=/efs/user/exp/old_battery_try bash submit_train_rmbench.sh
+RESUME_CKPT=${RESUME_CKPT:-}
+RESUME_CKPT_LOCAL=""
+if [ -n "${RESUME_CKPT}" ]; then
+    read -r -a _resume_tasks <<< "${TRAIN_TASKS}"
+    [ "${#_resume_tasks[@]}" = "1" ] || die "RESUME_CKPT requires exactly one TRAIN_TASK (got ${#_resume_tasks[@]} tasks)"
+    case "${RESUME_CKPT}" in
+        s3://*|/efs/*) ;;
+        *)
+            [ -e "${RESUME_CKPT}" ] || die "local RESUME_CKPT does not exist: ${RESUME_CKPT}"
+            python3 "$(dirname "${BASH_SOURCE[0]}")/examples/simBenchmarks/RMBench/train_files/resolve_resume_checkpoint.py" \
+                "${RESUME_CKPT}" >/dev/null
+            RESUME_CKPT_LOCAL="${RESUME_CKPT}"
+            RESUME_CKPT="${S3_ASSET_PREFIX}/resume/${RUN_NAME}/${TIMESTAMP}"
+            if [ -f "${RESUME_CKPT_LOCAL}" ]; then
+                RESUME_CKPT="${RESUME_CKPT}/$(basename "${RESUME_CKPT_LOCAL}")"
+            fi
+            ;;
+    esac
 fi
 
-# awscli's credential chain only reads AWS_* names, but the pod env carries the
-# S3_* names the submit script uses (and the image has no ~/.aws/credentials).
-# Without this mapping every `aws s3` call dies with "Unable to locate
-# credentials" -- and the ckpt mirror's `|| true` would swallow it silently.
-if [ -n "${S3_ACCESS_KEY:-}" ] && [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
-    export AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}"
-    export AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY:-}"
-fi
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-ap-northeast-1}"
-
-# ---- Step 1: link assets under the repo so starVLA's relative config paths resolve ----
-log "[1/5] preparing /data/work/starvla links from STARVLA_ASSET_ROOT=${STARVLA_ASSET_ROOT}"
-_t1=$SECONDS
-cd /data/work/starvla
-mkdir -p playground/Datasets playground
-ln -sfn "${STARVLA_ASSET_ROOT}/Pretrained_models"                          playground/Pretrained_models
-ln -sfn "${STARVLA_ASSET_ROOT}/datasets/libero"                            playground/Datasets/LEROBOT_LIBERO_DATA
-ln -sfn "${STARVLA_ASSET_ROOT}/datasets/LLaVA-OneVision-COCO"              playground/Datasets/LLaVA-OneVision-COCO
-log "[1/5] done ($((SECONDS - _t1))s)"
-
-# ---- Step 1b: fail fast if the linked assets are missing ----
-# A dangling symlink here does NOT fail loudly later: transformers falls back to
-# treating the local path as a HuggingFace repo id and every rank dies with an
-# opaque `HFValidationError: Repo id must be in the form ...`. Check up front so
-# the real problem (assets not synced to the asset bucket) is stated plainly.
-_asset_ok=1
-_check_dir() {
-    if [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; then
-        log "[1/5] OK: $2"
-    else
-        log "[1/5] [ERROR] MISSING/EMPTY: $2 ('$1' -> '$(readlink "$1" 2>/dev/null || echo 'not a symlink')')"
-        _asset_ok=0
-    fi
-}
-# base_vlm is already a repo-root-relative path (we are cd'ed into the repo).
-_check_dir "${base_vlm}"                             "base VLM (${base_vlm})"
-_check_dir "playground/Datasets/LEROBOT_LIBERO_DATA" "LIBERO dataset"
-if [ "${_asset_ok}" != "1" ]; then
-    log "[ERROR] Required assets are not present under STARVLA_ASSET_ROOT=${STARVLA_ASSET_ROOT}."
-    log "[ERROR] They are expected on the asset PVC, populated by the submit-side 'aws s3 sync'."
-    log "[HINT] From the submit host, upload them (this is what SYNC_ASSET=1 does):"
-    log "[HINT]   aws s3 sync playground/Pretrained_models s3://<asset-bucket>/<user>/starVLA/Pretrained_models"
-    log "[HINT]   aws s3 sync playground/Datasets/libero   s3://<asset-bucket>/<user>/starVLA/datasets/libero"
-    log "[HINT] Verify with: aws s3 ls s3://<asset-bucket>/<user>/starVLA/Pretrained_models/"
-    exit 1
+# ---- Optional: build + push the image (first setup / after dep changes) ----
+BUILD_IMAGE=${BUILD_IMAGE:-0}
+if [ "${BUILD_IMAGE}" = "1" ]; then
+    log "BUILD_IMAGE=1: ECR login + building ${IMAGE}"
+    aws ecr get-login-password --region ap-northeast-1 \
+        | docker login --username AWS --password-stdin 600627331169.dkr.ecr.ap-northeast-1.amazonaws.com
+    PUSH=1 IMAGE="${IMAGE}" bash deployment/docker/build.sh
+    log "image built and pushed: ${IMAGE}"
 fi
 
-export PYTHONPATH=/data/work/starvla:${PYTHONPATH:-}
-export PYTHONUNBUFFERED=1
-export TOKENIZERS_PARALLELISM=false
-export HF_HOME=/efs/huggingface_models
-export HF_HUB_OFFLINE=1
-
-# ---- Step 2: materialize datasets onto /local-ssd ----
-# The asset PVC is a read-only S3 FUSE mount: every open()/stat() during
-# training is an S3 round trip (~15k + ~50k files across the two datasets),
-# and if the cached stats config ever stops matching, the dataloader's cache
-# rebuild writes meta/stats_gr00t.json into the dataset dir -- which dies with
-# PermissionError on the read-only mount (the RMBench incident). Pull both
-# datasets to local NVMe with parallel S3 sync (seconds-to-minutes; a serial
-# cp through FUSE would take tens of minutes and log nothing), then re-point
-# the symlinks so the training command below needs no path changes. On ANY
-# failure, keep training from the mount -- today's behavior -- rather than
-# failing the job.
-MATERIALIZED_LOCAL=0
-LOCAL_LIBERO=/local-ssd/datasets/libero
-LOCAL_COCO=/local-ssd/datasets/LLaVA-OneVision-COCO
-log "[2/5] materializing datasets to /local-ssd (libero ~1.8GB + COCO ~5GB)"
-_t2=$SECONDS
-_avail_gb=$(df --output=avail -BG /local-ssd 2>/dev/null | tail -1 | tr -dc '0-9' || true)
-if [ -z "${_avail_gb}" ] || [ "${_avail_gb}" -lt 10 ]; then
-    log "[WARN] /local-ssd unavailable or <10GB free (avail=${_avail_gb:-?}G); training from the asset mount"
-elif ! aws s3 sync "${S3_ASSET_PREFIX}/datasets/libero" "${LOCAL_LIBERO}" >/dev/null; then
-    log "[WARN] S3 sync of libero failed; training from the asset mount"
-elif ! aws s3 sync "${S3_ASSET_PREFIX}/datasets/LLaVA-OneVision-COCO" "${LOCAL_COCO}" >/dev/null; then
-    log "[WARN] S3 sync of LLaVA-OneVision-COCO failed; training from the asset mount"
-else
-    _local_ok=1
-    for sub in libero_10_no_noops_1.0.0_lerobot libero_goal_no_noops_1.0.0_lerobot \
-               libero_object_no_noops_1.0.0_lerobot libero_spatial_no_noops_1.0.0_lerobot; do
-        if [ ! -f "${LOCAL_LIBERO}/${sub}/meta/info.json" ] || [ ! -f "${LOCAL_LIBERO}/${sub}/meta/modality.json" ]; then
-            log "[WARN] local copy incomplete: ${LOCAL_LIBERO}/${sub}"
-            _local_ok=0
-        fi
-    done
-    if [ "${_local_ok}" = "1" ]; then
-        ln -sfn "${LOCAL_LIBERO}" playground/Datasets/LEROBOT_LIBERO_DATA
-        ln -sfn "${LOCAL_COCO}"   playground/Datasets/LLaVA-OneVision-COCO
-        MATERIALIZED_LOCAL=1
-        log "[2/5] datasets on /local-ssd ($((SECONDS - _t2))s); symlinks re-pointed"
-    else
-        log "[WARN] local copy incomplete; training from the asset mount"
-    fi
-fi
-
-# ---- Step 3: GPU check ----
-log "[3/5] GPU status before training"
-nvidia-smi || true
-
-# ---- Step 4: start background S3 checkpoint mirror ----
-CKPT_DIR="${run_root_dir}/${run_id}"
-mkdir -p "${CKPT_DIR}"
-if [ -n "${S3_CHECKPOINT_DIR:-}" ]; then
-    log "[4/5] mirroring checkpoints to ${S3_CHECKPOINT_DIR} every ${CKPT_MIRROR_INTERVAL}s"
-    (
-        while true; do
-            aws s3 sync "${CKPT_DIR}" "${S3_CHECKPOINT_DIR}" \
-                --exclude 'wandb/*' >/dev/null 2>&1 || true
-            sleep "${CKPT_MIRROR_INTERVAL}"
-        done
-    ) &
-    MIRROR_PID=$!
-else
-    log "[4/5] S3 checkpoint mirror disabled (S3_CHECKPOINT_DIR empty)"
-fi
-
-# ---- Step 5: training ----
-log "[5/5] starting training: nproc=${NPROC_PER_NODE:-8} framework=${Framework_name} data_mix=${data_mix}"
-_t4=$SECONDS
-
-accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes "${NPROC_PER_NODE}" \
-  starVLA/training/train_starvla.py \
-  --config_yaml "${config_yaml}" \
-  --framework.name "${Framework_name}" \
-  --framework.qwenvl.base_vlm "${base_vlm}" \
-  --datasets.vla_data.data_root_dir "${libero_data_root}" \
-  --datasets.vla_data.data_mix "${data_mix}" \
-  --datasets.vla_data.per_device_batch_size "${per_device_bs}" \
-  --trainer.vla_data.video_backend torchvision_av \
-  --trainer.freeze_modules "${freeze_module_list}" \
-  --framework.working_memory.history_frames "${wm_history_frames}" \
-  --trainer.num_train_epochs "${num_train_epochs}" \
-  --trainer.save_interval "${save_interval}" \
-  --trainer.logging_frequency "${logging_frequency}" \
-  --trainer.eval_interval "${eval_interval}" \
-  --run_root_dir "${run_root_dir}" \
-  --run_id "${run_id}" \
-  --wandb_project "${WANDB_PROJECT}" \
-  --wandb_entity "${WANDB_ENTITY}" \
-&& log "[5/5] training finished ($((SECONDS - _t4))s)" \
-|| { log "[ERROR] training FAILED ($((SECONDS - _t4))s)"; exit 1; }
-
-# Final mirror pass + pull-back instructions.
-if [ -n "${S3_CHECKPOINT_DIR:-}" ]; then
-    aws s3 sync "${CKPT_DIR}" "${S3_CHECKPOINT_DIR}" --exclude 'wandb/*' || true
-    log "checkpoints mirrored to ${S3_CHECKPOINT_DIR}"
-fi
-
-# If the stats caches were rebuilt on the local copy (e.g. after a config
-# change), push them back so later runs -- including runs that train straight
-# off the mount -- skip the recomputation. Meta caches only, never the data.
-if [ "${MATERIALIZED_LOCAL}" = "1" ]; then
-    aws s3 sync "${LOCAL_LIBERO}" "${S3_ASSET_PREFIX}/datasets/libero" \
-        --exclude '*' \
-        --include '*/meta/stats_gr00t.json' \
-        --include '*/meta/steps_data_index.pkl' \
-        && log "[5/5] dataset meta caches pushed back to asset" \
-        || log "[WARN] meta cache push failed (non-fatal)"
-fi
-
-log "checkpoint location (EFS): ${CKPT_DIR}"
-find "${CKPT_DIR}" -maxdepth 3 -type f | sort || true
-log "PULL BACK LOCALLY:"
-log "  aws s3 cp ${S3_CHECKPOINT_DIR:-<s3>} ./playground/Checkpoints/${run_id}"
-
-cleanup
-EOS
-)
+# In-pod logic (asset links, conversion-if-missing + S3 push-back, ckpt mirror,
+# training) lives in the repo so it ships with the code snapshot and is
+# testable outside the submit path.
+START_CMD='set -euo pipefail; bash /data/work/starvla/examples/simBenchmarks/RMBench/train_files/run_rmbench_train_in_pod.sh'
 
 DRY_RUN=${DRY_RUN:-0}
 SYNC_CODE=${SYNC_CODE:-1}
 SYNC_ASSET=${SYNC_ASSET:-1}
+SYNC_RAW=${SYNC_RAW:-1}
 
 log "job name:      ${JOB_NAME}"
 log "run name:      ${RUN_NAME}"
+log "image:         ${IMAGE}"
 log "nproc/GPUs:    ${NPROC_PER_NODE}"
 log "efa limit:     ${EFA_LIMIT}"
 log "cpu limit:     ${CPU_LIMIT}"
 log "memory limit:  ${MEMORY_LIMIT}"
-log "framework:     ${Framework_name}"
 log "data mix:      ${data_mix}"
+log "train tasks:   ${TRAIN_TASKS}"
 log "base vlm:      ${base_vlm}"
 log "config yaml:   ${config_yaml}"
 log "train epochs:  ${num_train_epochs} (max_train_steps derived at runtime)"
-log "working mem:   ${working_memory_enabled} (history_frames=${wm_history_frames})"
 log "ckpt save dir: ${run_root_dir}/${run_id}"
 log "s3 mirror:     ${S3_CHECKPOINT_DIR}"
+log "resume source: ${RESUME_CKPT:-none}"
 
-# ---- Upload ckpt + data to the S3 asset bucket (skip with SYNC_ASSET=0) ----
+# Resume uploads are independent of SYNC_ASSET (which controls base models).
+if [ -n "${RESUME_CKPT_LOCAL}" ]; then
+    log "uploading resume checkpoint: ${RESUME_CKPT_LOCAL} -> ${RESUME_CKPT}"
+    if [ -d "${RESUME_CKPT_LOCAL}" ]; then
+        aws s3 sync "${RESUME_CKPT_LOCAL}" "${RESUME_CKPT}" --exclude 'wandb/*'
+    else
+        aws s3 cp "${RESUME_CKPT_LOCAL}" "${RESUME_CKPT}"
+    fi
+fi
+
+# ---- Upload base assets to the S3 asset bucket (skip with SYNC_ASSET=0) ----
+# The converted RMBench dataset is NOT synced here: it is produced in-pod on
+# the first run and pushed back to S3 by run_rmbench_train_in_pod.sh.
 if [ "${SYNC_ASSET}" = "1" ]; then
     log "syncing assets to S3: ${S3_ASSET_PREFIX}"
     aws s3 sync playground/Pretrained_models \
         "${S3_ASSET_PREFIX}/Pretrained_models" \
         --no-follow-symlinks
-    aws s3 sync playground/Datasets/libero \
-        "${S3_ASSET_PREFIX}/datasets/libero" \
-        --no-follow-symlinks
-    aws s3 sync playground/Datasets/LLaVA-OneVision-COCO \
-        "${S3_ASSET_PREFIX}/datasets/LLaVA-OneVision-COCO" \
-        --no-follow-symlinks
     log "asset sync done"
 else
     log "SYNC_ASSET=0, skipping asset sync"
+fi
+
+# ---- Upload raw RMBench data (first submit only; skip with SYNC_RAW=0) ----
+# Only the data/ subtree is synced, which naturally excludes .cache/huggingface.
+if [ "${SYNC_RAW}" = "1" ]; then
+    [ -d "${RMBENCH_RAW_LOCAL}/data" ] || die "raw RMBench data not found at ${RMBENCH_RAW_LOCAL}/data (set RMBENCH_RAW_LOCAL)"
+    log "syncing raw RMBench data to ${S3_ASSET_PREFIX}/datasets/rmbench_raw/data (37GB first time; incremental afterwards)"
+    aws s3 sync "${RMBENCH_RAW_LOCAL}/data" \
+        "${S3_ASSET_PREFIX}/datasets/rmbench_raw/data" \
+        --no-follow-symlinks
+    log "raw data sync done"
+else
+    log "SYNC_RAW=0, skipping raw data sync"
 fi
 
 # ---- Sync code to the S3 code bucket (skip with SYNC_CODE=0) ----
@@ -370,6 +269,7 @@ if [ "${SYNC_CODE}" = "1" ]; then
         --exclude 'playground/*' \
         --exclude '*.egg-info/*' \
         --exclude '.dockerfile' \
+        --exclude '.env.submit' \
         --exclude 'docs/*'
     log "code sync done"
 else
@@ -390,20 +290,20 @@ container_template=$(jq -n \
     --arg wandb_project    "$wandb_project" \
     --arg starvla_asset    "$STARVLA_ASSET_ROOT" \
     --arg s3_asset_prefix  "$S3_ASSET_PREFIX" \
-    --arg framework        "${Framework_name}" \
     --arg base_vlm         "${base_vlm}" \
     --arg config_yaml      "${config_yaml}" \
-    --arg libero_data_root "${libero_data_root}" \
+    --arg rmbench_data_root "${rmbench_data_root}" \
     --arg data_mix         "${data_mix}" \
+    --arg train_tasks      "${TRAIN_TASKS}" \
     --arg per_device_bs    "${per_device_bs}" \
     --arg freeze_module_list "${freeze_module_list}" \
     --arg num_train_epochs "${num_train_epochs}" \
-    --arg wm_history_frames "${wm_history_frames}" \
     --arg save_interval    "${save_interval}" \
     --arg logging_frequency "${logging_frequency}" \
     --arg eval_interval    "${eval_interval}" \
     --arg run_root_dir     "${run_root_dir}" \
     --arg run_id           "${run_id}" \
+    --arg resume_ckpt      "${RESUME_CKPT}" \
     --arg s3_ckpt_dir      "${S3_CHECKPOINT_DIR}" \
     --arg mirror_interval  "${CKPT_MIRROR_INTERVAL}" \
     --argjson nproc        "$NPROC_PER_NODE" \
@@ -414,7 +314,7 @@ container_template=$(jq -n \
     '{
         metadata: {
             labels: {
-                "job":"wm"
+                "job":"rmbench"
             }
         },
         spec: {
@@ -441,20 +341,20 @@ container_template=$(jq -n \
                         {name: "WANDB_WORKSPACE",        value: $wandb_entity},
                         {name: "STARVLA_ASSET_ROOT",     value: $starvla_asset},
                         {name: "S3_ASSET_PREFIX",        value: $s3_asset_prefix},
-                        {name: "Framework_name",         value: $framework},
                         {name: "base_vlm",               value: $base_vlm},
                         {name: "config_yaml",            value: $config_yaml},
-                        {name: "libero_data_root",       value: $libero_data_root},
+                        {name: "rmbench_data_root",      value: $rmbench_data_root},
                         {name: "data_mix",               value: $data_mix},
+                        {name: "TRAIN_TASKS",            value: $train_tasks},
                         {name: "per_device_bs",          value: $per_device_bs},
                         {name: "freeze_module_list",     value: $freeze_module_list},
                         {name: "num_train_epochs",       value: $num_train_epochs},
-                        {name: "wm_history_frames",      value: $wm_history_frames},
                         {name: "save_interval",          value: $save_interval},
                         {name: "logging_frequency",      value: $logging_frequency},
                         {name: "eval_interval",          value: $eval_interval},
                         {name: "run_root_dir",           value: $run_root_dir},
                         {name: "run_id",                 value: $run_id},
+                        {name: "RESUME_CKPT",            value: $resume_ckpt},
                         {name: "S3_CHECKPOINT_DIR",      value: $s3_ckpt_dir},
                         {name: "CKPT_MIRROR_INTERVAL",   value: $mirror_interval},
                         {name: "NPROC_PER_NODE",         value: ($nproc | tostring)},
@@ -590,11 +490,10 @@ if [ "${_http_code}" -ge 400 ] 2>/dev/null || [ -z "${_http_code}" ]; then
     exit 1
 fi
 
-# KOALA returns HTTP 200 even when the k8s API server REJECTS the object: the failure
-# arrives as a JSON payload ({"code": 10001, "message": "... is invalid ...", "data": null}).
-# Gating on the status code alone therefore logged "submit accepted" and "submit request
-# sent" for a job that was never created -- a non-run that reports as a run, which is the
-# single most expensive failure mode in this whole investigation. Check the body.
+# KOALA returns HTTP 200 even when the k8s API server REJECTS the object: the
+# failure arrives as a JSON payload ({"code": 10001, ...}). Gating on the
+# status code alone therefore logged "submit accepted" for a job that was never
+# created -- a non-run that reports as a run. Check the body.
 _koala_code=$(jq -r '.code // empty' "${_koala_response}" 2>/dev/null || true)
 if [ -n "${_koala_code}" ] && [ "${_koala_code}" != "0" ]; then
     log "[ERROR] KOALA returned HTTP ${_http_code} but the job was NOT created (code=${_koala_code})"
@@ -614,6 +513,6 @@ echo
 rm -f "${_koala_response}"
 
 log "submit request sent"
-log "after the job finishes, checkpoints will be at ${run_root_dir}/${run_id} on the /efs PVC (${EFS_PVC_NAME})."
+log "checkpoints mirror to ${S3_CHECKPOINT_DIR}_<task> on S3; each task's EFS copy under ${run_root_dir}/${run_id}_<task> is removed once its final sync succeeds (DELETE_EFS_CKPT_AFTER_SYNC=0 to keep)."
 log "to pull checkpoints locally:"
 log "  aws s3 sync ${S3_CHECKPOINT_DIR} ./playground/Checkpoints/${RUN_NAME}"

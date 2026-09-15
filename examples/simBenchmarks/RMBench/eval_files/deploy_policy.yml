@@ -1,0 +1,32 @@
+# starVLA policy config for RMBench eval (script/eval_policy.py --config this).
+# Required by RMBench main() — keep these keys; override via eval_rmbench.sh.
+policy_name: starvla_rmbench
+task_name: null            # set via --overrides
+task_config: demo_clean
+ckpt_setting: starvla      # free-form label used in the result dir name
+seed: 0
+instruction_type: unseen   # seen | unseen (benchmark protocol uses unseen)
+
+# starVLA policy server connection (run_policy_server.sh)
+host: 127.0.0.1
+port: 5694
+
+# Checkpoint + normalization stats (dataset_statistics.json is auto-located
+# two dirs up from the .pt; set stats_path to override).
+policy_ckpt_path: null     # e.g. playground/Checkpoints/<run>/checkpoints/steps_X_pytorch_model.pt
+stats_path: null
+unnorm_key: null           # only needed if dataset_statistics.json has multiple keys
+
+# Observation contract (must match training: obs_image_size [224, 224]).
+image_size: [224, 224]
+
+# Auto-read the checkpoint's training contract from the policy server.
+# No-WM checkpoints retain 3-image input; anchor checkpoints use 8 images.
+history_frames: null
+history_stride: null
+history_image_size: null
+
+# Optional diagnostic output: exact model inputs/actions at each inference,
+# and execution.jsonl with TOPP errors (including errors swallowed upstream).
+# Can also be set through RMBENCH_TRACE_DIR in the simulator process.
+trace_dir: null
